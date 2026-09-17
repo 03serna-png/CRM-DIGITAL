@@ -4,9 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>CRM Digital — Servicios Digitales</title>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <style>
 :root{
   --bg:#04060d;
@@ -485,11 +482,12 @@ input:checked + .slider:before{transform:translateX(19px); background:#fff;}
     </div>
     <div class="panel" style="margin-bottom:0;">
       <h3 style="margin-bottom:14px; font-size:16px;">Entrar</h3>
-      <div class="field"><label>Correo</label><input id="authEmail" type="email" placeholder="tu@correo.com"></div>
-      <div class="field"><label>Contraseña</label><input id="authPass" type="password" placeholder="••••••••"></div>
       <div id="authError" style="color:var(--red); font-size:12.5px; margin-bottom:10px; display:none;"></div>
-      <button class="btn-primary" style="width:100%; justify-content:center;" onclick="doLogin()">Entrar</button>
-      <p style="font-size:11.5px; color:var(--muted); margin-top:12px; text-align:center; line-height:1.5;">Entra con el mismo correo en cada equipo — tus datos se sincronizan solos.</p>
+      <button class="btn-primary" style="width:100%; justify-content:center; gap:8px;" onclick="startMicrosoftLogin()">
+        <span>🪟</span> Conectar con Microsoft
+      </button>
+      <button class="btn-ghost" style="width:100%; justify-content:center; margin-top:8px;" onclick="continueOffline()">Usar sin sincronizar</button>
+      <p style="font-size:11.5px; color:var(--muted); margin-top:12px; text-align:center; line-height:1.5;">Entra con la misma cuenta de Microsoft en cada equipo — tus datos se guardan en tu OneDrive y se sincronizan solos.</p>
     </div>
   </div>
 </div>
@@ -519,7 +517,7 @@ input:checked + .slider:before{transform:translateX(19px); background:#fff;}
         <input id="globalSearch" placeholder="Buscar clientes, trámites, servicios...">
       </div>
       <button class="icon-btn" onclick="toggleTheme()" id="themeBtn">🌙</button>
-      <button class="icon-btn" onclick="doLogout()" id="logoutBtn" title="Cerrar sesión" style="display:none;">🚪</button>
+      <button class="icon-btn" onclick="doLogout()" id="logoutBtn" title="Desconectar OneDrive" style="display:none;">🚪</button>
       <div class="avatar">SD</div>
     </div>
 
@@ -1014,103 +1012,178 @@ function persist(){
 }
 
 /* ============================================================
-   SINCRONIZACIÓN EN LA NUBE (Firebase) — mismo dato en todos tus equipos
+   SINCRONIZACIÓN CON ONEDRIVE (Microsoft Graph, sin librerías, PKCE)
+   Mismo mecanismo que ya usas en tu Bóveda de contraseñas.
 ============================================================ */
-// 1) Ve a https://console.firebase.google.com, crea un proyecto gratis.
-// 2) Activa "Firestore Database" y "Authentication > Correo/contraseña".
-// 3) En Authentication, agrega un usuario (tu correo + una contraseña).
-// 4) En Configuración del proyecto > tus apps > Config, copia esos valores aquí abajo:
-const firebaseConfig = {
-  apiKey: "PEGA_AQUI",
-  authDomain: "PEGA_AQUI",
-  projectId: "PEGA_AQUI",
-  storageBucket: "PEGA_AQUI",
-  messagingSenderId: "PEGA_AQUI",
-  appId: "PEGA_AQUI",
-};
-const FIREBASE_READY = firebaseConfig.apiKey && firebaseConfig.apiKey !== 'PEGA_AQUI';
+// 1) Ve a https://portal.azure.com → Azure Active Directory → Registros de aplicaciones → Nuevo registro.
+//    Nombre: "CRM Digital". Tipos de cuenta admitidas: cuentas personales de Microsoft.
+//    Plataforma: SPA (Single-page application). URI de redirección: la URL de GitHub Pages donde subas este archivo
+//    (ej. https://TU-USUARIO.github.io/TU-REPO/).
+// 2) Copia el "Id. de aplicación (cliente)" y pégalo abajo en AZURE_CLIENT_ID.
+// 3) Sube este archivo como index.html a un repositorio de GitHub con GitHub Pages activado,
+//    igual que hiciste con el repo de la Bóveda.
+const AZURE_CLIENT_ID = "PEGA_AQUI_TU_CLIENT_ID";
+const AZURE_READY = AZURE_CLIENT_ID && AZURE_CLIENT_ID !== 'PEGA_AQUI_TU_CLIENT_ID';
+const MS_REDIRECT_URI = window.location.origin + window.location.pathname;
+const MS_SCOPES = "Files.ReadWrite.AppFolder offline_access";
+const MS_AUTHORITY = "https://login.microsoftonline.com/consumers";
+const ONEDRIVE_FILE = "https://graph.microsoft.com/v1.0/me/drive/special/approot:/crm_data.json:/content";
 
-let currentUid = null;
-let firestoreUnsub = null;
 let syncTimer = null;
-let db = null;
+let msSignedIn = false;
+let pollTimer = null;
 
-if(FIREBASE_READY){
-  firebase.initializeApp(firebaseConfig);
-  const auth = firebase.auth();
-  db = firebase.firestore();
+function b64url(buf){
+  return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+async function sha256(str){ return await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)); }
+function randomStr(len){ const a=new Uint8Array(len); crypto.getRandomValues(a); return b64url(a.buffer); }
 
-  auth.onAuthStateChanged(user=>{
-    if(user){
-      currentUid = user.uid;
-      document.getElementById('authGate').style.display='none';
-      document.getElementById('logoutBtn').style.display='';
-      subscribeToCloud();
-    } else {
-      currentUid = null;
-      if(firestoreUnsub){ firestoreUnsub(); firestoreUnsub=null; }
-      document.getElementById('logoutBtn').style.display='none';
-      document.getElementById('authGate').style.display='flex';
-    }
+async function startMicrosoftLogin(){
+  if(!AZURE_READY){ alert('Todavía falta configurar el Client ID de Azure en el código.'); return; }
+  const verifier = randomStr(64);
+  sessionStorage.setItem('pkce_verifier', verifier);
+  const challenge = b64url(await sha256(verifier));
+  const p = new URLSearchParams({
+    client_id: AZURE_CLIENT_ID, response_type:'code', redirect_uri: MS_REDIRECT_URI,
+    response_mode:'query', scope: MS_SCOPES, code_challenge: challenge, code_challenge_method:'S256',
   });
-
-  window.doLogin = function(){
-    const email = document.getElementById('authEmail').value.trim();
-    const pass = document.getElementById('authPass').value;
-    const errEl = document.getElementById('authError');
-    errEl.style.display='none';
-    auth.signInWithEmailAndPassword(email, pass).catch(()=>{
-      errEl.textContent = 'No se pudo entrar: revisa tu correo y contraseña.';
-      errEl.style.display='block';
-    });
-  };
-  window.doLogout = function(){
-    if(confirm('¿Cerrar sesión en este equipo?')) auth.signOut();
-  };
-} else {
-  // Firebase aún no configurado: la app sigue funcionando solo en este equipo.
-  document.getElementById('authGate').style.display='none';
-  window.doLogin = function(){};
-  window.doLogout = function(){ alert('La sincronización en la nube todavía no está configurada.'); };
+  window.location.href = `${MS_AUTHORITY}/oauth2/v2.0/authorize?${p}`;
 }
 
-function subscribeToCloud(){
-  const ref = db.collection('crm_data').doc(currentUid);
-  firestoreUnsub = ref.onSnapshot(snap=>{
-    if(snap.exists){
-      const data = snap.data();
-      settings = data.settings || settings;
-      clients = data.clients || clients;
-      cards = data.cards || cards;
-      recargas = data.recargas || recargas;
-      simSales = data.simSales || simSales;
-      if(data.theme) applyLightDark(data.theme);
-      if(data.dashTheme) applyDashTheme(data.dashTheme);
-      localStorage.setItem('crm_settings', JSON.stringify(settings));
-      localStorage.setItem('crm_clients', JSON.stringify(clients));
-      localStorage.setItem('crm_cards', JSON.stringify(cards));
-      localStorage.setItem('crm_recargas', JSON.stringify(recargas));
-      localStorage.setItem('crm_simsales', JSON.stringify(simSales));
-      renderAll(); renderRecargas(); renderSimSales(); renderVigenciasRef(); loadSettingsUI();
-    } else {
-      pushToCloud(true);
-    }
+function continueOffline(){
+  document.getElementById('authGate').style.display = 'none';
+}
+
+function doLogout(){
+  if(!confirm('¿Desconectar OneDrive en este equipo?')) return;
+  localStorage.removeItem('ms_access_token');
+  localStorage.removeItem('ms_refresh_token');
+  localStorage.removeItem('ms_expires_at');
+  msSignedIn = false;
+  if(pollTimer) clearInterval(pollTimer);
+  document.getElementById('logoutBtn').style.display='none';
+  document.getElementById('authGate').style.display='flex';
+}
+
+async function exchangeCodeForToken(code){
+  const verifier = sessionStorage.getItem('pkce_verifier') || '';
+  const body = new URLSearchParams({
+    client_id: AZURE_CLIENT_ID, grant_type:'authorization_code', code,
+    redirect_uri: MS_REDIRECT_URI, code_verifier: verifier,
   });
+  const res = await fetch(`${MS_AUTHORITY}/oauth2/v2.0/token`, {
+    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body,
+  });
+  const tok = await res.json();
+  if(tok.access_token) saveTokens(tok);
+  return !!tok.access_token;
+}
+
+function saveTokens(tok){
+  localStorage.setItem('ms_access_token', tok.access_token);
+  if(tok.refresh_token) localStorage.setItem('ms_refresh_token', tok.refresh_token);
+  localStorage.setItem('ms_expires_at', String(Date.now() + (tok.expires_in||3600)*1000));
+}
+
+async function ensureFreshToken(){
+  const expiresAt = parseInt(localStorage.getItem('ms_expires_at')||'0', 10);
+  if(Date.now() < expiresAt - 60000) return true;
+  const refresh = localStorage.getItem('ms_refresh_token');
+  if(!refresh) return false;
+  const body = new URLSearchParams({
+    client_id: AZURE_CLIENT_ID, grant_type:'refresh_token', refresh_token: refresh, scope: MS_SCOPES,
+  });
+  const res = await fetch(`${MS_AUTHORITY}/oauth2/v2.0/token`, {
+    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body,
+  });
+  const tok = await res.json();
+  if(tok.access_token){ saveTokens(tok); return true; }
+  return false;
+}
+
+async function loadFromOneDrive(){
+  if(!(await ensureFreshToken())) return null;
+  try{
+    const res = await fetch(ONEDRIVE_FILE, { headers:{ Authorization:'Bearer '+localStorage.getItem('ms_access_token') } });
+    if(res.status===404) return null;
+    if(!res.ok) return null;
+    return await res.json();
+  }catch(e){ return null; }
 }
 
 function pushToCloud(immediate){
-  if(!currentUid || !db) return;
+  if(!msSignedIn) return;
   clearTimeout(syncTimer);
-  const doPush = ()=>{
-    db.collection('crm_data').doc(currentUid).set({
+  const doPush = async ()=>{
+    if(!(await ensureFreshToken())) return;
+    const payload = {
       settings, clients, cards, recargas, simSales,
       theme: document.body.dataset.theme,
       dashTheme: document.body.getAttribute('data-dash-theme'),
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-    }, {merge:true});
+      updatedAt: Date.now(),
+    };
+    fetch(ONEDRIVE_FILE, {
+      method:'PUT',
+      headers:{ Authorization:'Bearer '+localStorage.getItem('ms_access_token'), 'Content-Type':'application/json' },
+      body: JSON.stringify(payload),
+    }).catch(()=>{});
   };
   if(immediate) doPush(); else syncTimer = setTimeout(doPush, 600);
 }
+
+function applyCloudData(data){
+  if(!data) return;
+  settings = data.settings || settings;
+  clients = data.clients || clients;
+  cards = data.cards || cards;
+  recargas = data.recargas || recargas;
+  simSales = data.simSales || simSales;
+  if(data.theme) applyLightDark(data.theme);
+  if(data.dashTheme) applyDashTheme(data.dashTheme);
+  localStorage.setItem('crm_settings', JSON.stringify(settings));
+  localStorage.setItem('crm_clients', JSON.stringify(clients));
+  localStorage.setItem('crm_cards', JSON.stringify(cards));
+  localStorage.setItem('crm_recargas', JSON.stringify(recargas));
+  localStorage.setItem('crm_simsales', JSON.stringify(simSales));
+  renderAll(); renderRecargas(); renderSimSales(); renderVigenciasRef(); loadSettingsUI();
+}
+
+async function onSignedIn(){
+  msSignedIn = true;
+  document.getElementById('authGate').style.display='none';
+  document.getElementById('logoutBtn').style.display='';
+  const remote = await loadFromOneDrive();
+  if(remote) applyCloudData(remote); else pushToCloud(true);
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async ()=>{
+    const data = await loadFromOneDrive();
+    if(data && data.updatedAt > (window.__lastAppliedUpdate||0)){
+      window.__lastAppliedUpdate = data.updatedAt;
+      applyCloudData(data);
+    }
+  }, 25000);
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState==='visible' && msSignedIn){
+      loadFromOneDrive().then(d=>{ if(d) applyCloudData(d); });
+    }
+  });
+}
+
+async function initMicrosoftSync(){
+  if(!AZURE_READY){ document.getElementById('authGate').style.display='none'; return; }
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get('code');
+  if(code){
+    const ok = await exchangeCodeForToken(code);
+    window.history.replaceState({}, document.title, MS_REDIRECT_URI);
+    if(ok){ onSignedIn(); return; }
+  }
+  const hasToken = !!localStorage.getItem('ms_access_token');
+  if(hasToken && await ensureFreshToken()){ onSignedIn(); }
+  else { document.getElementById('authGate').style.display='flex'; }
+}
+initMicrosoftSync();
 
 /* ============================================================
    RECARGAS TELEFÓNICAS — operadoras presentes en México
